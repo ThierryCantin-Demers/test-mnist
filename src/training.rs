@@ -30,7 +30,7 @@ pub struct MnistTrainingConfig {
     #[config(default = 256)]
     pub batch_size: usize,
 
-    #[config(default = 8)]
+    #[config(default = 1)]
     pub num_workers: usize,
 
     #[config(default = 42)]

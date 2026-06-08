@@ -5,13 +5,7 @@ edition = "2024"
 
 [dependencies]
 burn = {
-    version = "0.22.0-pre.1",
-    features = ["std", "tui", "train", "vision"],
+    path = "../burn/crates/burn",
+    features = ["std", "tui", "train", "vision", "flex", "wgpu"],
     default-features = false,
-    git = "https://github.com/tracel-ai/burn"
 }
-
-[features]
-default = []
-wgpu = ["burn/wgpu"]
-cpu = ["burn/flex"]
