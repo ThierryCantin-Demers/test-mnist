@@ -72,14 +72,18 @@ impl Model {
             targets,
         }
     }
-    pub fn quantize(self, scheme: QuantScheme) -> Self {
-        let calibration = Calibration::MinMax;
+
+    pub fn quantize(mut self, scheme: QuantScheme) -> Self {
         let mut quantizer = Quantizer {
-            calibration,
+            calibration: Calibration::MinMax,
             scheme,
         };
 
-        self.quantize_weights(&mut quantizer)
+        self.activation = self.activation.quantize_weights(&mut quantizer);
+        self.fc1 = self.fc1.quantize_weights(&mut quantizer);
+        self.fc2 = self.fc2.quantize_weights(&mut quantizer);
+        self.dropout = self.dropout.quantize_weights(&mut quantizer);
+        self
     }
 }
 

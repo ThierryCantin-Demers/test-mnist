@@ -396,6 +396,7 @@ dependencies = [
  "burn-store",
  "burn-train",
  "burn-vision",
+ "burn-wgpu",
 ]
 
 [[package]]
@@ -786,8 +787,10 @@ dependencies = [
  "aligned-vec",
  "bon",
  "burn-core",
+ "burn-cubecl",
  "burn-ir",
  "bytemuck",
+ "cubecl",
  "derive-new",
  "half",
  "image",

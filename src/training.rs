@@ -89,20 +89,22 @@ pub fn run(device: Device) {
         lr_scheduler.init().unwrap(),
     ));
 
+    let model = result.model.clone();
+
     let dataloader_test = DataLoaderBuilder::new(MnistBatcher::default())
         .batch_size(config.batch_size)
         .num_workers(2)
         .build(MnistDataset::test());
 
+    // let renderer = EvaluatorBuilder::new(ARTIFACT_DIR)
     EvaluatorBuilder::new(ARTIFACT_DIR)
         .renderer(result.renderer)
         .metrics((AccuracyMetric::new(), LossMetric::new()))
         .summary()
-        .build(result.model.clone())
-        .eval("test", dataloader_test);
+        .build(model.clone())
+        .eval("test", dataloader_test.clone());
 
-    result
-        .model
+    model
         .save_file(format!("{ARTIFACT_DIR}/model"), &CompactRecorder::new())
         .expect("Failed to save trained model");
 
