@@ -30,3 +30,7 @@ test-mnist = { path = "../test-mnist" }
 [[bench]]
 harness = false
 name = "dequantize"
+
+[[bench]]
+harness = false
+name = "dequantize_kernel"

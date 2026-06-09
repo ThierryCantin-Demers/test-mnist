@@ -1,13 +1,17 @@
+//! Benchmarks the standalone cubecl `dequantize` kernel in isolation: a
+//! quantized tensor materialized back to full precision, with no matmul.
+//!
+//! This complements `dequantize.rs` (the end-to-end inference benchmark, which
+//! is the real use case via the fused dequant-on-read path). Here we time only
+//! the dequantization of a representative weight tensor, while still reporting
+//! each scheme's model accuracy so we can see the cost/quality trade-off.
+
 use burn::{
     Tensor,
-    data::{
-        dataloader::batcher::Batcher,
-        dataset::{Dataset, vision::MnistDataset},
-    },
     module::Module,
     record::{CompactRecorder, Recorder},
     tensor::{
-        Device, DeviceKind, Int,
+        Device, DeviceKind,
         quantization::{QuantLevel, QuantScheme},
     },
 };
@@ -17,62 +21,52 @@ use burnbench::{
 };
 use test_mnist::{
     ARTIFACT_DIR,
-    data::MnistBatcher,
     inference::{Quality, default_schemes, predictions, prepare_eval, quality},
     model::Model,
 };
 
-pub struct DequantizeBenchmark {
+/// Times `Tensor::dequantize` on the model's quantized hidden-layer weights —
+/// the cubecl dequantize kernel, isolated from the matmul. One `execute`
+/// dequantizes every quantized weight once, i.e. the per-forward dequant work.
+pub struct DequantizeKernelBenchmark {
     device: Device,
-    model: Model,
-    quant_scheme: Option<QuantScheme>,
-    samples: usize,
+    weights: Vec<Tensor<2>>,
+    scheme: QuantScheme,
 }
 
-impl Benchmark for DequantizeBenchmark {
-    type Input = Tensor<3>;
-    type Output = Tensor<1, Int>;
+impl Benchmark for DequantizeKernelBenchmark {
+    type Input = Vec<Tensor<2>>;
+    type Output = Vec<Tensor<2>>;
 
     fn name(&self) -> String {
-        match &self.quant_scheme {
-            Some(scheme) => {
-                let level = match scheme.level {
-                    QuantLevel::Tensor => "tensor".to_string(),
-                    QuantLevel::Block(b) => {
-                        format!(
-                            "block{}",
-                            b.to_vec()
-                                .into_iter()
-                                .map(|s| s.to_string())
-                                .collect::<Vec<_>>()
-                                .join("x")
-                        )
-                    }
-                };
-                format!("dequantize-{:?}-{level}", scheme.value).to_lowercase()
-            }
-            None => "dequantize-native".to_string(),
-        }
+        let level = match self.scheme.level {
+            QuantLevel::Tensor => "tensor".to_string(),
+            QuantLevel::Block(b) => format!(
+                "block{}",
+                b.to_vec()
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join("x")
+            ),
+        };
+        format!("dequantize-{:?}-{level}", self.scheme.value).to_lowercase()
     }
 
     fn shapes(&self) -> Vec<Vec<usize>> {
-        vec![vec![self.samples, 28, 28]]
-    }
-
-    fn execute(&self, input: Self::Input) -> Self::Output {
-        predictions(&self.model, input)
-    }
-
-    fn prepare(&self) -> Self::Input {
-        let dataset = MnistDataset::test();
-        let items: Vec<_> = (0..self.samples).filter_map(|i| dataset.get(i)).collect();
-        let batch = MnistBatcher::default().batch(items, &self.device);
-        let images = batch.images;
-        images
+        self.weights.iter().map(|w| w.dims().to_vec()).collect()
     }
 
     fn num_samples(&self) -> usize {
         TIMING_ITERATIONS
+    }
+
+    fn execute(&self, input: Self::Input) -> Self::Output {
+        input.into_iter().map(|w| w.dequantize()).collect()
+    }
+
+    fn prepare(&self) -> Self::Input {
+        self.weights.clone()
     }
 
     fn sync(&self) {
@@ -80,13 +74,8 @@ impl Benchmark for DequantizeBenchmark {
     }
 }
 
-/// Images per forward pass in the timing loop. Kept small so the matmul is
-/// weight-bandwidth-bound — that's the regime where the dequant-on-read cost of
-/// each scheme actually shows up (a large batch is compute-bound and hides it).
-const TIMING_BATCH: usize = 256;
-
 /// Images used to measure accuracy/agreement: the full test set, so the quality
-/// estimate is stable and independent of the (small) timing batch.
+/// estimate is stable and independent of the timing.
 const ACCURACY_SAMPLES: usize = 10_000;
 
 /// Number of measured (post-warmup) timing repetitions per scheme.
@@ -128,9 +117,11 @@ impl BenchBackend {
     }
 }
 
-/// One model's timing together with its accuracy/agreement vs full precision.
+/// A scheme's dequantize-kernel timing together with the quantized model's
+/// accuracy/agreement vs full precision.
 struct Row {
-    timing: BenchmarkResult,
+    /// `None` for the native (unquantized) baseline — nothing to dequantize.
+    timing: Option<BenchmarkResult>,
     quality: Quality,
     native: bool,
 }
@@ -142,65 +133,61 @@ fn bench(device: &Device) -> Vec<Row> {
             .expect("Trained model should exist; run train first"),
     );
 
-    // Shared test batch + full-precision baseline predictions, computed once.
-    // These accuracy forwards are separate from `run_benchmark`'s timing loop
-    // (whose outputs are discarded), so they don't affect the measured timings.
+    // Accuracy baseline (full test set, model predictions). Independent of the
+    // dequantize timing below — it just confirms each scheme stays usable.
     let eval = prepare_eval(&native, device, ACCURACY_SAMPLES);
 
-    // Warm up the device before any measured run: ramp GPU clocks and settle
-    // autotune for the timing-batch shape so the first scheme isn't timed cold.
-    let warmup = DequantizeBenchmark {
-        quant_scheme: None,
-        model: native.clone(),
-        device: device.clone(),
-        samples: TIMING_BATCH,
-    };
-    let warmup_input = warmup.prepare();
+    // Warm up the dequantize kernel before any measured run, using the model's
+    // quantized weights under the first scheme.
+    let warm_weights = native
+        .clone()
+        .quantize(default_schemes()[0])
+        .quantized_weights();
     for _ in 0..20 {
-        let _ = warmup.execute(warmup_input.clone());
+        for w in &warm_weights {
+            let _ = w.clone().dequantize();
+        }
     }
-    warmup.sync();
+    device.sync().unwrap();
 
-    // Build every (scheme, model, accuracy) entry once. Accuracy is
-    // deterministic, so it's computed a single time and reused across timing runs.
-    let mut entries: Vec<(Option<QuantScheme>, Model, Quality, bool)> = Vec::new();
-    entries.push((
-        None,
-        native.clone(),
-        quality(&eval.native_pred, &eval),
-        true,
-    ));
+    let mut rows = Vec::new();
+
+    // native: accuracy reference only, nothing to dequantize.
+    rows.push(Row {
+        timing: None,
+        quality: quality(&eval.native_pred, &eval),
+        native: true,
+    });
+
     for scheme in default_schemes() {
+        // Quantize the model once; reuse it for both accuracy and weights.
         let model = native.clone().quantize(scheme);
         let quality = quality(&predictions(&model, eval.images.clone()), &eval);
-        entries.push((Some(scheme), model, quality, false));
+
+        // Timing: dequantize the model's quantized hidden-layer weights (the
+        // output layer is left in f32 and excluded), best of `RUNS` runs.
+        let weights = model.quantized_weights();
+        let mut best: Option<BenchmarkResult> = None;
+        for _ in 0..RUNS {
+            let timing = run_benchmark(DequantizeKernelBenchmark {
+                device: device.clone(),
+                weights: weights.clone(),
+                scheme,
+            });
+            best = Some(match best {
+                Some(prev) if prev.computed.min <= timing.computed.min => prev,
+                _ => timing,
+            });
+        }
+
+        rows.push(Row {
+            timing: best,
+            quality,
+            native: false,
+        });
     }
 
-    // Time each scheme `RUNS` times back-to-back and keep the run with the
-    // smallest `min` — the best-case, least-throttled measurement.
-    entries
-        .into_iter()
-        .map(|(quant_scheme, model, quality, native)| {
-            let mut best: Option<BenchmarkResult> = None;
-            for _ in 0..RUNS {
-                let timing = run_benchmark(DequantizeBenchmark {
-                    quant_scheme,
-                    model: model.clone(),
-                    device: device.clone(),
-                    samples: TIMING_BATCH,
-                });
-                best = Some(match best {
-                    Some(prev) if prev.computed.min <= timing.computed.min => prev,
-                    _ => timing,
-                });
-            }
-            Row {
-                timing: best.expect("RUNS >= 1"),
-                quality,
-                native,
-            }
-        })
-        .collect()
+    rows
 }
 
 fn main() {
@@ -212,7 +199,7 @@ fn main() {
     let rows = bench(&device);
 
     println!(
-        "\n=== quantization: timing (batch {TIMING_BATCH}, best of {RUNS} runs) vs accuracy ({ACCURACY_SAMPLES} samples) ==="
+        "\n=== dequantize kernel (model weights, best of {RUNS} runs) vs model accuracy ({ACCURACY_SAMPLES} samples) ==="
     );
     // Format a duration as fixed-decimal milliseconds for stable column widths.
     let ms = |d: std::time::Duration| format!("{:.3}ms", d.as_secs_f64() * 1000.0);
@@ -230,19 +217,33 @@ fn main() {
                 row.quality.disagreements.to_string(),
             )
         };
+        let (name, median, mean, min) = match &row.timing {
+            Some(t) => (
+                t.name.clone(),
+                ms(t.computed.median),
+                ms(t.computed.mean),
+                ms(t.computed.min),
+            ),
+            None => (
+                "native".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+            ),
+        };
         println!(
             "{:<26} {:>11} {:>11} {:>11} {:>10} {:>11} {:>9}",
-            row.timing.name,
-            ms(row.timing.computed.median),
-            ms(row.timing.computed.mean),
-            ms(row.timing.computed.min),
+            name,
+            median,
+            mean,
+            min,
             format!("{:.2}%", row.quality.accuracy),
             agreement,
             disagree,
         );
     }
 
-    let benches: Vec<BenchmarkResult> = rows.into_iter().map(|row| row.timing).collect();
+    let benches: Vec<BenchmarkResult> = rows.into_iter().filter_map(|row| row.timing).collect();
     __save_result(benches, backend_name, device_name, None, None, feature_name);
 }
 

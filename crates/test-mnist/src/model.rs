@@ -85,6 +85,20 @@ impl Model {
         }
     }
 
+    /// Weight tensors of the quantized hidden layers only, in order.
+    ///
+    /// The output layer (10-wide) is left in full precision by [`quantize`] and
+    /// is deliberately excluded — `[..last]` drops it.
+    ///
+    /// [`quantize`]: Model::quantize
+    pub fn quantized_weights(&self) -> Vec<Tensor<2>> {
+        let last = self.layers.len() - 1;
+        self.layers[..last]
+            .iter()
+            .map(|layer| layer.weight.val())
+            .collect()
+    }
+
     pub fn quantize(mut self, scheme: QuantScheme) -> Self {
         let mut quantizer = Quantizer {
             calibration: Calibration::MinMax,
