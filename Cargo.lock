@@ -476,6 +476,7 @@ version = "0.22.0-pre.1"
 dependencies = [
  "burn-autodiff",
  "burn-core",
+ "burn-cpu",
  "burn-flex",
  "burn-nn",
  "burn-optim",

@@ -76,7 +76,7 @@ impl Benchmark for DequantizeBenchmark {
     }
 
     fn sync(&self) {
-        self.device.sync().expect("Should sync without error");
+        self.device.sync().unwrap();
     }
 }
 
@@ -92,17 +92,22 @@ const ACCURACY_SAMPLES: usize = 10_000;
 /// Number of measured (post-warmup) timing repetitions per scheme.
 const TIMING_ITERATIONS: usize = 100;
 
-/// Backend the timing benchmark runs on. `Wgpu` is the GPU target; `Flex` is a
-/// portable CPU reference backend that produces far more reproducible timings
-/// (no autotune / clock-ramp jitter) but is not representative of GPU speed.
-/// Only backends enabled in `Cargo.toml` are available — add the `ndarray`
-/// feature and a variant here if you want an optimized CPU backend.
+/// Number of independent timing runs per scheme; the reported timing is the run
+/// with the smallest `min`. On a noisy device (e.g. an integrated GPU whose
+/// clock fluctuates) the best run approximates the un-throttled performance and
+/// is far more reproducible than any single run.
+const RUNS: usize = 1;
+
 const BACKEND: BenchBackend = BenchBackend::Wgpu;
 
+// wgpu, cuda, rocm, cpu use cubek dequant kernel
+// flex, ndarray, tch, candle use their own impl
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum BenchBackend {
     Wgpu,
     Flex,
+    Cpu,
 }
 
 impl BenchBackend {
@@ -110,6 +115,7 @@ impl BenchBackend {
         match self {
             BenchBackend::Wgpu => Device::wgpu(DeviceKind::DefaultDevice),
             BenchBackend::Flex => Device::flex(),
+            BenchBackend::Cpu => Device::cpu(),
         }
     }
 
@@ -117,6 +123,7 @@ impl BenchBackend {
         match self {
             BenchBackend::Wgpu => "wgpu",
             BenchBackend::Flex => "flex",
+            BenchBackend::Cpu => "cpu",
         }
     }
 }
@@ -154,40 +161,46 @@ fn bench(device: &Device) -> Vec<Row> {
     }
     warmup.sync();
 
-    let mut rows = Vec::new();
-
-    // native: reuse the baseline predictions, no extra forward pass
-    let quality_native = quality(&eval.native_pred, &eval);
-    let timing = run_benchmark(DequantizeBenchmark {
-        quant_scheme: None,
-        model: native.clone(),
-        device: device.clone(),
-        samples: TIMING_BATCH,
-    });
-    rows.push(Row {
-        timing,
-        quality: quality_native,
-        native: true,
-    });
-
-    // quantized variants
+    // Build every (scheme, model, accuracy) entry once. Accuracy is
+    // deterministic, so it's computed a single time and reused across timing runs.
+    let mut entries: Vec<(Option<QuantScheme>, Model, Quality, bool)> = Vec::new();
+    entries.push((
+        None,
+        native.clone(),
+        quality(&eval.native_pred, &eval),
+        true,
+    ));
     for scheme in default_schemes() {
         let model = native.clone().quantize(scheme);
         let quality = quality(&predictions(&model, eval.images.clone()), &eval);
-        let timing = run_benchmark(DequantizeBenchmark {
-            quant_scheme: Some(scheme),
-            model,
-            device: device.clone(),
-            samples: TIMING_BATCH,
-        });
-        rows.push(Row {
-            timing,
-            quality,
-            native: false,
-        });
+        entries.push((Some(scheme), model, quality, false));
     }
 
-    rows
+    // Time each scheme `RUNS` times back-to-back and keep the run with the
+    // smallest `min` — the best-case, least-throttled measurement.
+    entries
+        .into_iter()
+        .map(|(quant_scheme, model, quality, native)| {
+            let mut best: Option<BenchmarkResult> = None;
+            for _ in 0..RUNS {
+                let timing = run_benchmark(DequantizeBenchmark {
+                    quant_scheme,
+                    model: model.clone(),
+                    device: device.clone(),
+                    samples: TIMING_BATCH,
+                });
+                best = Some(match best {
+                    Some(prev) if prev.computed.min <= timing.computed.min => prev,
+                    _ => timing,
+                });
+            }
+            Row {
+                timing: best.expect("RUNS >= 1"),
+                quality,
+                native,
+            }
+        })
+        .collect()
 }
 
 fn main() {
@@ -199,7 +212,7 @@ fn main() {
     let rows = bench(&device);
 
     println!(
-        "\n=== quantization: timing (batch {TIMING_BATCH}) vs accuracy ({ACCURACY_SAMPLES} samples) ==="
+        "\n=== quantization: timing (batch {TIMING_BATCH}, best of {RUNS} runs) vs accuracy ({ACCURACY_SAMPLES} samples) ==="
     );
     // Format a duration as fixed-decimal milliseconds for stable column widths.
     let ms = |d: std::time::Duration| format!("{:.3}ms", d.as_secs_f64() * 1000.0);

@@ -14,7 +14,7 @@ readme = "README.md"
 [workspace.dependencies]
 burn = {
     path = "../burn/crates/burn",
-    features = ["std", "tui", "train", "vision", "flex", "wgpu"],
+    features = ["std", "tui", "train", "vision", "flex", "wgpu", "cpu"],
     default-features = false,
 }
 
