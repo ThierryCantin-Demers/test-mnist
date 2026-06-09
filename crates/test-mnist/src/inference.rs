@@ -28,38 +28,25 @@ pub fn default_schemes() -> Vec<QuantScheme> {
         level: QuantLevel::Tensor,
         mode: QuantMode::Symmetric,
     };
-    vec![
-        QuantScheme {
-            value: QuantValue::Q8S,
-            level: QuantLevel::Tensor,
-            ..base
-        },
-        QuantScheme {
-            value: QuantValue::Q8S,
-            level: QuantLevel::Block(BlockSize::new([32])),
-            ..base
-        },
-        QuantScheme {
-            value: QuantValue::Q4S,
-            level: QuantLevel::Tensor,
-            ..base
-        },
-        QuantScheme {
-            value: QuantValue::Q4S,
-            level: QuantLevel::Block(BlockSize::new([32])),
-            ..base
-        },
-        QuantScheme {
-            value: QuantValue::Q2S,
-            level: QuantLevel::Tensor,
-            ..base
-        },
-        QuantScheme {
-            value: QuantValue::Q2S,
-            level: QuantLevel::Block(BlockSize::new([32])),
-            ..base
-        },
-    ]
+
+    let mut cases = vec![];
+    for value in [QuantValue::Q8S, QuantValue::Q4S, QuantValue::Q2S] {
+        for level in [
+            QuantLevel::Tensor,
+            QuantLevel::Block(BlockSize::new([16, 16])),
+            QuantLevel::Block(BlockSize::new([128])),
+            QuantLevel::Block(BlockSize::new([32])),
+            QuantLevel::Block(BlockSize::new([16])),
+        ] {
+            cases.push(QuantScheme {
+                value,
+                level,
+                ..base
+            });
+        }
+    }
+
+    cases
 }
 
 /// Quantize the full-precision model once per scheme, keeping each scheme paired
@@ -72,6 +59,58 @@ pub fn quantize_variants(native: &Model, schemes: Vec<QuantScheme>) -> Vec<(Quan
         .collect()
 }
 
+/// A fixed test batch plus the full-precision baseline predictions, computed
+/// once and reused to score every model so accuracy and agreement are measured
+/// over the exact same inputs.
+pub struct Eval {
+    pub images: Tensor<3>,
+    pub targets: Tensor<1, Int>,
+    pub native_pred: Tensor<1, Int>,
+    pub n: usize,
+}
+
+/// Build the shared evaluation batch from the first `num_samples` test images
+/// and record the full-precision model's predictions as the baseline.
+pub fn prepare_eval(native: &Model, device: &Device, num_samples: usize) -> Eval {
+    let dataset = MnistDataset::test();
+    let items: Vec<_> = (0..num_samples).filter_map(|i| dataset.get(i)).collect();
+    let n = items.len();
+    let batch = MnistBatcher::default().batch(items, device);
+    let native_pred = predictions(native, batch.images.clone());
+    Eval {
+        images: batch.images,
+        targets: batch.targets,
+        native_pred,
+        n,
+    }
+}
+
+/// One model's quality relative to the full-precision baseline.
+#[derive(Clone, Copy, Debug)]
+pub struct Quality {
+    /// Percent of samples classified correctly.
+    pub accuracy: f64,
+    /// Percent of samples whose prediction is identical to full precision.
+    pub agreement: f64,
+    /// Number of samples whose prediction differs from full precision.
+    pub disagreements: i64,
+}
+
+/// Score a model's already-computed `pred` against the shared [`Eval`] baseline.
+///
+/// Takes predictions rather than the model so callers that have already run the
+/// forward pass (e.g. the timing benchmark) don't pay for a second one.
+pub fn quality(pred: &Tensor<1, Int>, eval: &Eval) -> Quality {
+    let correct = count_equal(pred.clone(), eval.targets.clone());
+    let agree = count_equal(pred.clone(), eval.native_pred.clone());
+    let pct = |c: i64| 100.0 * c as f64 / eval.n as f64;
+    Quality {
+        accuracy: pct(correct),
+        agreement: pct(agree),
+        disagreements: eval.n as i64 - agree,
+    }
+}
+
 /// Run `num_samples` test images through the full-precision model and every
 /// quantized variant, then report each variant's accuracy and how closely it
 /// agrees with the full-precision predictions.
@@ -81,41 +120,27 @@ pub fn compare_quantization(
     device: &Device,
     num_samples: usize,
 ) {
-    // Gather the first `num_samples` items from the test set into one batch.
-    let dataset = MnistDataset::test();
-    let items: Vec<_> = (0..num_samples).filter_map(|i| dataset.get(i)).collect();
-    let n = items.len();
-    let batch = MnistBatcher::default().batch(items, device);
-    let images = batch.images;
-    let targets = batch.targets;
+    let eval = prepare_eval(native, device, num_samples);
+    let native_quality = quality(&eval.native_pred, &eval);
 
-    let native_pred = predictions(native, images.clone());
-    let native_correct = count_equal(native_pred.clone(), targets.clone());
-
-    let pct = |c: i64| 100.0 * c as f64 / n as f64;
-    println!("\n=== Quantization comparison over {n} samples ===");
+    println!("\n=== Quantization comparison over {} samples ===", eval.n);
     println!(
         "{:<44} {:>9} {:>11} {:>14}",
         "Scheme", "Accuracy", "Agreement", "Disagreements"
     );
     println!(
         "{:<44} {:>8.2}% {:>11} {:>14}",
-        "native (f32)",
-        pct(native_correct),
-        "—",
-        "—"
+        "native (f32)", native_quality.accuracy, "—", "—"
     );
 
     for (scheme, model) in variants {
-        let pred = predictions(model, images.clone());
-        let correct = count_equal(pred.clone(), targets.clone());
-        let agree = count_equal(pred, native_pred.clone());
+        let q = quality(&predictions(model, eval.images.clone()), &eval);
         println!(
             "{:<44} {:>8.2}% {:>10.2}% {:>14}",
             scheme_label(scheme),
-            pct(correct),
-            pct(agree),
-            n as i64 - agree,
+            q.accuracy,
+            q.agreement,
+            q.disagreements,
         );
     }
     println!(
@@ -125,7 +150,7 @@ pub fn compare_quantization(
 }
 
 /// Predicted class per image: argmax over the 10 logits, shape `[batch]`.
-fn predictions(model: &Model, images: Tensor<3>) -> Tensor<1, Int> {
+pub fn predictions(model: &Model, images: Tensor<3>) -> Tensor<1, Int> {
     model.forward(images).argmax(1).flatten::<1>(0, 1)
 }
 

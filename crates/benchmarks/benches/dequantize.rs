@@ -16,7 +16,11 @@ use burnbench::{
     BenchmarkSystemInfo, run_benchmark,
 };
 use test_mnist::{
-    ARTIFACT_DIR, data::MnistBatcher, inference::default_schemes, inference_device, model::Model,
+    ARTIFACT_DIR,
+    data::MnistBatcher,
+    inference::{Quality, default_schemes, predictions, prepare_eval, quality},
+    inference_device,
+    model::Model,
 };
 
 pub struct DequantizeBenchmark {
@@ -35,7 +39,16 @@ impl Benchmark for DequantizeBenchmark {
             Some(scheme) => {
                 let level = match scheme.level {
                     QuantLevel::Tensor => "tensor".to_string(),
-                    QuantLevel::Block(b) => format!("block{}", b.num_elements()),
+                    QuantLevel::Block(b) => {
+                        format!(
+                            "block{}",
+                            b.to_vec()
+                                .into_iter()
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>()
+                                .join("x")
+                        )
+                    }
                 };
                 format!("dequantize-{:?}-{level}", scheme.value).to_lowercase()
             }
@@ -48,7 +61,7 @@ impl Benchmark for DequantizeBenchmark {
     }
 
     fn execute(&self, input: Self::Input) -> Self::Output {
-        self.model.forward(input).argmax(1).flatten::<1>(0, 1)
+        predictions(&self.model, input)
     }
 
     fn prepare(&self) -> Self::Input {
@@ -59,58 +72,79 @@ impl Benchmark for DequantizeBenchmark {
         images
     }
 
+    fn num_samples(&self) -> usize {
+        TIMING_ITERATIONS
+    }
+
     fn sync(&self) {
-        self.device.sync().unwrap();
+        self.device.sync().expect("Should sync without error");
     }
 }
 
-struct Config {
-    quant_scheme: Option<QuantScheme>,
+/// Images per forward pass in the timing loop. Kept small so the matmul is
+/// weight-bandwidth-bound — that's the regime where the dequant-on-read cost of
+/// each scheme actually shows up (a large batch is compute-bound and hides it).
+const TIMING_BATCH: usize = 256;
+
+/// Images used to measure accuracy/agreement: the full test set, so the quality
+/// estimate is stable and independent of the (small) timing batch.
+const ACCURACY_SAMPLES: usize = 10_000;
+
+/// Number of measured (post-warmup) timing repetitions per scheme.
+const TIMING_ITERATIONS: usize = 100;
+
+/// One model's timing together with its accuracy/agreement vs full precision.
+struct Row {
+    timing: BenchmarkResult,
+    quality: Quality,
+    native: bool,
 }
 
-const NUM_SAMPLES: usize = 1000;
-
-#[allow(dead_code)]
-fn bench(device: &Device) -> Vec<BenchmarkResult> {
-    let mut results = Vec::new();
+fn bench(device: &Device) -> Vec<Row> {
     let native = Model::new(&device).load_record(
         CompactRecorder::new()
             .load(format!("{ARTIFACT_DIR}/model").into(), &device)
             .expect("Trained model should exist; run train first"),
     );
 
-    // native
-    let benchmark = DequantizeBenchmark {
+    // Shared test batch + full-precision baseline predictions, computed once.
+    // These accuracy forwards are separate from `run_benchmark`'s timing loop
+    // (whose outputs are discarded), so they don't affect the measured timings.
+    let eval = prepare_eval(&native, device, ACCURACY_SAMPLES);
+    let mut rows = Vec::new();
+
+    // native: reuse the baseline predictions, no extra forward pass
+    let quality_native = quality(&eval.native_pred, &eval);
+    let timing = run_benchmark(DequantizeBenchmark {
         quant_scheme: None,
         model: native.clone(),
         device: device.clone(),
-        samples: NUM_SAMPLES,
-    };
-    let result = run_benchmark(benchmark);
-    results.push(result);
-
-    // quantized
-    let quant_schemes = default_schemes().into_iter().map(|scheme| Config {
-        quant_scheme: Some(scheme),
+        samples: TIMING_BATCH,
+    });
+    rows.push(Row {
+        timing,
+        quality: quality_native,
+        native: true,
     });
 
-    for config in quant_schemes {
-        let model = if let Some(scheme) = &config.quant_scheme {
-            native.clone().quantize(*scheme)
-        } else {
-            native.clone()
-        };
-        let benchmark = DequantizeBenchmark {
-            quant_scheme: config.quant_scheme.clone(),
+    // quantized variants
+    for scheme in default_schemes() {
+        let model = native.clone().quantize(scheme);
+        let quality = quality(&predictions(&model, eval.images.clone()), &eval);
+        let timing = run_benchmark(DequantizeBenchmark {
+            quant_scheme: Some(scheme),
             model,
             device: device.clone(),
-            samples: NUM_SAMPLES,
-        };
-        let result = run_benchmark(benchmark);
-        results.push(result);
+            samples: TIMING_BATCH,
+        });
+        rows.push(Row {
+            timing,
+            quality,
+            native: false,
+        });
     }
 
-    results
+    rows
 }
 
 fn main() {
@@ -119,23 +153,36 @@ fn main() {
     let feature_name = "wgpu";
 
     let device_name = format!("{:?}", &device);
-    let benches = bench(&device);
+    let rows = bench(&device);
 
-    println!("\n=== dequantize benchmarks ({NUM_SAMPLES} samples) ===");
     println!(
-        "{:<32} {:>12} {:>12} {:>12}",
-        "Benchmark", "Median", "Mean", "Min"
+        "\n=== quantization: timing (batch {TIMING_BATCH}) vs accuracy ({ACCURACY_SAMPLES} samples) ==="
     );
-    for b in &benches {
+    println!(
+        "{:<26} {:>13} {:>13} {:>10} {:>11} {:>9}",
+        "Scheme", "Median", "Mean", "Accuracy", "Agreement", "Disagree"
+    );
+    for row in &rows {
+        let (agreement, disagree) = if row.native {
+            ("—".to_string(), "—".to_string())
+        } else {
+            (
+                format!("{:.2}%", row.quality.agreement),
+                row.quality.disagreements.to_string(),
+            )
+        };
         println!(
-            "{:<32} {:>12} {:>12} {:>12}",
-            b.name,
-            format!("{:?}", b.computed.median),
-            format!("{:?}", b.computed.mean),
-            format!("{:?}", b.computed.min),
+            "{:<26} {:>11.8}ms {:>11.8}ms {:>10} {:>11} {:>9}",
+            row.timing.name,
+            format!("{:?}", row.timing.computed.median),
+            format!("{:?}", row.timing.computed.mean),
+            format!("{:.2}%", row.quality.accuracy),
+            agreement,
+            disagree,
         );
     }
 
+    let benches: Vec<BenchmarkResult> = rows.into_iter().map(|row| row.timing).collect();
     __save_result(benches, backend_name, device_name, None, None, feature_name);
 }
 
