@@ -1,0 +1,15 @@
+[package]
+name = "test-mnist"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+burn = { workspace = true }
+
+[[bin]]
+name = "train"
+path = "bin/train.rs"
+
+[[bin]]
+name = "infer"
+path = "bin/infer.rs"

@@ -1,0 +1,32 @@
+
+
+[package]
+authors = ["Tracel Technologies Inc."]
+categories = ["science"]
+description = "Benchmarks of quantize"
+edition.workspace = true
+license.workspace = true
+name = "benchmarks"
+readme = "README.md"
+version = "0.1.0"
+
+[features]
+wgpu = []
+f32 = []
+
+
+[dependencies]
+burn = { workspace = true }
+burnbench = { git = "https://github.com/tracel-ai/burn-bench", rev = "df75b3da844e89cdac46625e405b27ee9c04ee73" }
+test-mnist = { path = "../test-mnist" }
+
+# [patch."https://github.com/tracel-ai/burn"]
+# burn = { path = "../../burn/crates/burn" }
+
+# [patch."https://github.com/tracel-ai/cubecl"]
+# cubecl = { path = "../../cubecl/crates/cubecl" }
+
+
+[[bench]]
+harness = false
+name = "dequantize"

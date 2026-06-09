@@ -14,29 +14,38 @@ use crate::data::MnistBatch;
 #[derive(Module, Debug)]
 pub struct Model {
     dropout: nn::Dropout,
-    fc1: nn::Linear,
-    fc2: nn::Linear,
-    fc3: nn::Linear,
     activation: nn::Gelu,
+    layers: Vec<nn::Linear>,
 }
 
 const NUM_CLASSES: usize = 10;
+const INPUT_SIZE: usize = 28 * 28;
+const NUM_LAYERS: usize = 4;
+const LAYER_SIZE: usize = 4096;
 
 impl Model {
     pub fn new(device: &Device) -> Self {
-        let input_size = 28 * 28;
-        let fc1 = nn::LinearConfig::new(input_size, 128).init(device);
-        let fc2 = nn::LinearConfig::new(128, 128).init(device);
-        let fc3 = nn::LinearConfig::new(128, NUM_CLASSES).init(device);
+        assert!(NUM_LAYERS > 0);
+        let mut layers = Vec::new();
+        let mut prev_size = INPUT_SIZE;
+
+        for _ in 0..NUM_LAYERS {
+            let fc = nn::LinearConfig::new(prev_size, LAYER_SIZE).init(device);
+            layers.push(fc);
+            prev_size = LAYER_SIZE;
+        }
+
+        let fc = nn::LinearConfig::new(prev_size, NUM_CLASSES).init(device);
+        layers.push(fc);
 
         let dropout = nn::DropoutConfig::new(0.25).init();
 
+        let activation = nn::Gelu::new();
+
         Self {
             dropout,
-            fc1,
-            fc2,
-            fc3,
-            activation: nn::Gelu::new(),
+            layers,
+            activation,
         }
     }
 
@@ -46,17 +55,18 @@ impl Model {
         let x = input.reshape([batch_size, 1, height, width]).detach();
 
         let [batch_size, channels, height, width] = x.dims();
-        let x = x.reshape([batch_size, channels * height * width]);
+        let mut x = x.reshape([batch_size, channels * height * width]);
 
-        let x = self.fc1.forward(x);
-        let x = self.activation.forward(x);
-        let x = self.dropout.forward(x);
+        let last = self.layers.len() - 1;
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward(x);
+            if i != last {
+                x = self.activation.forward(x);
+                x = self.dropout.forward(x);
+            }
+        }
 
-        let x = self.fc2.forward(x);
-        let x = self.activation.forward(x);
-        let x = self.dropout.forward(x);
-
-        self.fc3.forward(x)
+        x
     }
 
     pub fn forward_classification(&self, item: MnistBatch) -> ClassificationOutput {
@@ -80,9 +90,17 @@ impl Model {
         };
 
         self.activation = self.activation.quantize_weights(&mut quantizer);
-        self.fc1 = self.fc1.quantize_weights(&mut quantizer);
-        self.fc2 = self.fc2.quantize_weights(&mut quantizer);
         self.dropout = self.dropout.quantize_weights(&mut quantizer);
+
+        let output = self.layers.pop().expect("model has at least one layer");
+        let mut layers: Vec<nn::Linear> = self
+            .layers
+            .into_iter()
+            .map(|layer| layer.quantize_weights(&mut quantizer))
+            .collect();
+        layers.push(output);
+        self.layers = layers;
+
         self
     }
 }
