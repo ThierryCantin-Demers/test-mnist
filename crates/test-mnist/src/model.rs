@@ -25,7 +25,9 @@ const LAYER_SIZE: usize = 4096;
 
 impl Model {
     pub fn new(device: &Device) -> Self {
-        assert!(NUM_LAYERS > 0);
+        const {
+            assert!(NUM_LAYERS >= 2);
+        }
         let mut layers = Vec::new();
         let mut prev_size = INPUT_SIZE;
 

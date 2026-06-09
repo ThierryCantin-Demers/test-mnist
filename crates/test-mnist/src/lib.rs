@@ -8,10 +8,9 @@ pub mod training;
 pub static ARTIFACT_DIR: &str = "/tmp/test-mnist";
 
 pub fn train_device() -> Device {
-    // return Device::flex();
-    return Device::wgpu(burn::tensor::DeviceKind::DefaultDevice);
+    Device::wgpu(burn::tensor::DeviceKind::DefaultDevice)
 }
 
 pub fn inference_device() -> Device {
-    return Device::wgpu(burn::tensor::DeviceKind::DefaultDevice);
+    Device::wgpu(burn::tensor::DeviceKind::DefaultDevice)
 }

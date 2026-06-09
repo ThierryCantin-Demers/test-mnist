@@ -7,7 +7,7 @@ use burn::{
     module::Module,
     record::{CompactRecorder, Recorder},
     tensor::{
-        Device, Int,
+        Device, DeviceKind, Int,
         quantization::{QuantLevel, QuantScheme},
     },
 };
@@ -19,7 +19,6 @@ use test_mnist::{
     ARTIFACT_DIR,
     data::MnistBatcher,
     inference::{Quality, default_schemes, predictions, prepare_eval, quality},
-    inference_device,
     model::Model,
 };
 
@@ -93,6 +92,35 @@ const ACCURACY_SAMPLES: usize = 10_000;
 /// Number of measured (post-warmup) timing repetitions per scheme.
 const TIMING_ITERATIONS: usize = 100;
 
+/// Backend the timing benchmark runs on. `Wgpu` is the GPU target; `Flex` is a
+/// portable CPU reference backend that produces far more reproducible timings
+/// (no autotune / clock-ramp jitter) but is not representative of GPU speed.
+/// Only backends enabled in `Cargo.toml` are available — add the `ndarray`
+/// feature and a variant here if you want an optimized CPU backend.
+const BACKEND: BenchBackend = BenchBackend::Wgpu;
+
+#[derive(Clone, Copy)]
+enum BenchBackend {
+    Wgpu,
+    Flex,
+}
+
+impl BenchBackend {
+    fn device(self) -> Device {
+        match self {
+            BenchBackend::Wgpu => Device::wgpu(DeviceKind::DefaultDevice),
+            BenchBackend::Flex => Device::flex(),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            BenchBackend::Wgpu => "wgpu",
+            BenchBackend::Flex => "flex",
+        }
+    }
+}
+
 /// One model's timing together with its accuracy/agreement vs full precision.
 struct Row {
     timing: BenchmarkResult,
@@ -111,6 +139,21 @@ fn bench(device: &Device) -> Vec<Row> {
     // These accuracy forwards are separate from `run_benchmark`'s timing loop
     // (whose outputs are discarded), so they don't affect the measured timings.
     let eval = prepare_eval(&native, device, ACCURACY_SAMPLES);
+
+    // Warm up the device before any measured run: ramp GPU clocks and settle
+    // autotune for the timing-batch shape so the first scheme isn't timed cold.
+    let warmup = DequantizeBenchmark {
+        quant_scheme: None,
+        model: native.clone(),
+        device: device.clone(),
+        samples: TIMING_BATCH,
+    };
+    let warmup_input = warmup.prepare();
+    for _ in 0..20 {
+        let _ = warmup.execute(warmup_input.clone());
+    }
+    warmup.sync();
+
     let mut rows = Vec::new();
 
     // native: reuse the baseline predictions, no extra forward pass
@@ -148,9 +191,9 @@ fn bench(device: &Device) -> Vec<Row> {
 }
 
 fn main() {
-    let device = inference_device();
-    let backend_name = "wgpu".to_string();
-    let feature_name = "wgpu";
+    let device = BACKEND.device();
+    let backend_name = BACKEND.name().to_string();
+    let feature_name = BACKEND.name();
 
     let device_name = format!("{:?}", &device);
     let rows = bench(&device);
@@ -158,9 +201,12 @@ fn main() {
     println!(
         "\n=== quantization: timing (batch {TIMING_BATCH}) vs accuracy ({ACCURACY_SAMPLES} samples) ==="
     );
+    // Format a duration as fixed-decimal milliseconds for stable column widths.
+    let ms = |d: std::time::Duration| format!("{:.3}ms", d.as_secs_f64() * 1000.0);
+
     println!(
-        "{:<26} {:>13} {:>13} {:>10} {:>11} {:>9}",
-        "Scheme", "Median", "Mean", "Accuracy", "Agreement", "Disagree"
+        "{:<26} {:>11} {:>11} {:>11} {:>10} {:>11} {:>9}",
+        "Scheme", "Median", "Mean", "Min", "Accuracy", "Agreement", "Disagree"
     );
     for row in &rows {
         let (agreement, disagree) = if row.native {
@@ -172,10 +218,11 @@ fn main() {
             )
         };
         println!(
-            "{:<26} {:>11.8}ms {:>11.8}ms {:>10} {:>11} {:>9}",
+            "{:<26} {:>11} {:>11} {:>11} {:>10} {:>11} {:>9}",
             row.timing.name,
-            format!("{:?}", row.timing.computed.median),
-            format!("{:?}", row.timing.computed.mean),
+            ms(row.timing.computed.median),
+            ms(row.timing.computed.mean),
+            ms(row.timing.computed.min),
             format!("{:.2}%", row.quality.accuracy),
             agreement,
             disagree,

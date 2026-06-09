@@ -123,7 +123,10 @@ pub fn compare_quantization(
     let eval = prepare_eval(native, device, num_samples);
     let native_quality = quality(&eval.native_pred, &eval);
 
-    println!("\n=== Quantization comparison over {} samples ===", eval.n);
+    println!(
+        "\n=== MNIST Quantization comparison over {} samples ===",
+        eval.n
+    );
     println!(
         "{:<44} {:>9} {:>11} {:>14}",
         "Scheme", "Accuracy", "Agreement", "Disagreements"
