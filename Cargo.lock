@@ -323,6 +323,8 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "burnbench",
+ "cubecl",
+ "cubek-quant",
  "test-mnist",
 ]
 
@@ -877,7 +879,6 @@ dependencies = [
 [[package]]
 name = "burnbench"
 version = "0.1.0"
-source = "git+https://github.com/tracel-ai/burn-bench?rev=df75b3da844e89cdac46625e405b27ee9c04ee73#df75b3da844e89cdac46625e405b27ee9c04ee73"
 dependencies = [
  "arboard",
  "cfg-if",
